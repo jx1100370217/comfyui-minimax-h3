@@ -1,0 +1,96 @@
+{
+  "title": "示例项目标题",
+  "slug": "example-project",
+  "subtitle": "通用 AI 影视短片",
+  "lesson": "在这里填写希望观众带走的核心信息。",
+  "minimum_duration": 20,
+  "output_width": 1080,
+  "output_height": 1920,
+  "output_fps": 24,
+  "output_filename": "example-project_vertical_1080x1920.mp4",
+  "assets": {
+    "directory": "input/story_workflow2/example-project",
+    "identity_reference": "identity_reference.png",
+    "identity_references": {
+      "protagonist": "protagonist_reference.png"
+    },
+    "reference_subjects": "1"
+  },
+  "subjects": [
+    {
+      "id": "protagonist",
+      "reference_picture": 1,
+      "description": "the same protagonist throughout the film; preserve face, hair, wardrobe, body proportions, age, and distinguishing details from the identity reference"
+    }
+  ],
+  "speaker_map": {
+    "主人公": "protagonist"
+  },
+  "default_voice_reference": "protagonist",
+  "voice_references": {
+    "protagonist": {
+      "file": "protagonist_voice_ref.wav",
+      "label": "the protagonist's clean voice reference",
+      "voice": "zh-CN-YunxiNeural",
+      "sample_text": "你好，这是一段清晰自然的中文声线参考。",
+      "rate": "-4%",
+      "pitch": "+0Hz",
+      "volume": "+0%"
+    }
+  },
+  "style": {
+    "visual": "Photorealistic cinematic live-action, natural skin texture, physically accurate lighting, coherent motion and camera direction, restrained film grain, and phone-safe vertical composition.",
+    "soundscape": "Use only physically synchronized ambience and Foley. No crowd babble, improvised speech, singing, duplicated voices, or unrelated sound effects.",
+    "music": "N/A"
+  },
+  "seed": 920260901,
+  "width": 768,
+  "height": 1344,
+  "fps": 24,
+  "frames_per_shot": 243,
+  "steps": 14,
+  "sampler": "euler",
+  "scheduler": "beta57",
+  "audio_spine": {
+    "enabled": true
+  },
+  "chains": [
+    [
+      1,
+      2
+    ]
+  ],
+  "scenes": [
+    {
+      "id": 1,
+      "subject_ids": [
+        "protagonist"
+      ],
+      "narration": "在这里填写第一段旁白。",
+      "narration_offset": 1.2,
+      "visual_action": "Describe a single continuous action for the protagonist. Keep the protagonist clearly visible and preserve the identity reference.",
+      "action_timing": "Establish the setting first, then follow one motivated action with stable camera direction and continuous movement.",
+      "sound_design": "Natural location ambience and Foley synchronized to the visible action; no human speech.",
+      "dialogue": {
+        "speaker": "主人公",
+        "speaker_id": "protagonist",
+        "subject_id": 1,
+        "start": 2.0,
+        "text": "在这里填写由主人公说出的明确对白。",
+        "language": "Chinese",
+        "audio_spine": true
+      }
+    },
+    {
+      "id": 2,
+      "subject_ids": [
+        "protagonist"
+      ],
+      "narration": "在这里填写第二段旁白。",
+      "narration_offset": 1.0,
+      "visual_action": "Show the consequence or conclusion through a second continuous action without any unscripted speech.",
+      "action_timing": "Maintain visual continuity with the previous shot and end on a clean readable image.",
+      "sound_design": "Natural ambience and Foley only; all visible mouths remain closed."
+    }
+  ]
+}
