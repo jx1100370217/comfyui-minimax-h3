@@ -27,7 +27,6 @@ class Workflow2VideoFromPaths:
             f"path_{letter}": ("STRING", {"forceInput": True})
             for letter in "bcdefgh"
         }
-        optional["bgm"] = ("AUDIO",)
         return {
             "required": {
                 "path_a": ("STRING", {"forceInput": True}),
@@ -121,6 +120,7 @@ class Workflow2StoryAssembler:
             f"path_{letter}": ("STRING", {"forceInput": True})
             for letter in "bcdefgh"
         }
+        optional["bgm"] = ("AUDIO",)
         return {
             "required": {
                 "config_path": ("STRING", {"default": "story/workflow2/stories/story.json"}),
