@@ -97,21 +97,32 @@ def _sampler_widgets(node: dict, spec: dict) -> None:
     values[11] = str(spec["sampler"])
     values[12] = str(spec["scheduler"])
     if len(values) > 15:
-        values[14] = "off"
-        values[15] = "cut"
+        values[14] = str(spec.get("chain_gain_control", "off"))
+        values[15] = str(spec.get("continuity", "cut"))
+        values[16] = int(spec.get("bank_clip_frames", 22))
+        values[17] = str(spec.get("color_level", "off"))
+        values[18] = float(spec.get("join_anchor_noise", 0.0))
+        values[19] = bool(spec.get("join_blend", False))
+        values[20] = float(spec.get("handoff_release", 0.30))
+        values[21] = float(spec.get("bank_ref_noise", 0.0))
+        values[22] = bool(spec.get("end_anchor", False))
+        values[23] = "off"
+        values[24] = bool(spec.get("audio_lock", False))
+        values[25] = int(spec.get("handoff_taper", 0))
+        values[26] = str(spec.get("handoff_depth", "block"))
     if len(values) > 19:
-        values[19] = False
+        values[19] = bool(spec.get("join_blend", False))
     if len(values) > 38:
-        values[27] = False
+        values[27] = bool(spec.get("self_anchor_voice", False))
         values[28] = "match"
         values[29] = True
         values[30] = 1.0
-        values[31] = True
+        values[31] = bool(spec.get("low_ram_master", True))
         values[32] = "(none)"
-        values[33] = "luma+contrast"
-        values[34] = "22"
-        values[35] = 0.0
-        values[36] = False
+        values[33] = str(spec.get("master_normalize", "luma+contrast"))
+        values[34] = str(spec.get("pin_frames", "22"))
+        values[35] = float(spec.get("pin_noise", 0.0))
+        values[36] = bool(spec.get("pin_renorm", False))
         values[37] = str(spec.get("reference_subjects", ""))
         values[38] = True
     node["widgets_values"] = values
@@ -162,6 +173,7 @@ def _story_assembler_node(node_id: int, position: tuple[float, float], title: st
             {"name": "config_path", "type": "STRING", "widget": {"name": "config_path"}, "link": None},
             {"name": "path_a", "type": "STRING", "link": None},
             *({"name": f"path_{letter}", "type": "STRING", "link": None} for letter in "bcdefgh"),
+            {"name": "bgm", "type": "AUDIO", "link": None},
         ],
         "outputs": [
             {"name": "video", "type": "VIDEO", "links": []},
@@ -179,6 +191,7 @@ def build_visual_workflow(
     config_path: Path,
     identity_input: str,
     voice_inputs: list[tuple[str, str]],
+    bgm_input: str | None,
     chain_specs: list[dict],
     chain_part_indices: list[list[int]],
     model_names: dict[str, str],
@@ -196,12 +209,16 @@ def build_visual_workflow(
             (-2350, -760),
             f"工作流2 · {title}",
             "这是配置驱动的 MiniMax H3 可视化长视频工作流。\n\n"
+            f"故事级身份命名空间：story:{slug}\n"
+            "每个故事拥有独立角色卡；禁止复用其他故事的脸、发型、体型、服饰配色、道具签名或公共身份参考图。缺少故事专属参考图时，只按本故事角色卡中的特性生成。\n\n"
             "1. 先检查左侧模型、身份参考图、声音参考和青色的同步音频脊柱。\n"
             "2. 每句对白会拆成独立的‘说话人锁定’镜头：只接入该角色的身份图、声线与同步音频脊柱，避免角色换脸、换声或代说台词。\n"
-            "3. 无对白镜头保持原有分镜链；锁定对白镜头会在画布内自动回拼为原始叙事链。\n"
-            "4. 右上角低内存合并节点保存最终原生视频，便于检查 H3 的分镜输出。\n"
-            "5. 右下角精准时轴节点读取回拼后的 H3 链，按真实帧数生成旁白、带角色名的对白字幕和环境声闪避，并保存发布成片。\n"
-            "6. 修改故事时只更换 JSON 配置，再重新生成此画布。\n\n"
+            "3. 标记 shot_contract.isolated 的脱缰、落马、接触和多人动作会自动拆成独立 H3 上下文，严格锁定动作归属、演员/动物数量和肢体连续性。\n"
+            "4. 默认每个分镜都是一次独立 H3 采样；chains 只负责按剧本顺序回拼，避免把多个叙事事件混在一次生成里。\n"
+            "5. 锁定对白和高风险动作镜头会在画布内自动回拼为原始叙事链。\n"
+            "6. 右上角低内存合并节点保存最终原生视频，便于检查 H3 的分镜输出。\n"
+            "7. 右下角精准时轴节点读取回拼后的 H3 链，按真实帧数生成旁白、带角色名的对白字幕，并将明确来源的独立 BGM 在人声处自动闪避后保存发布成片。\n"
+            "8. 修改故事时只更换 JSON 配置，再重新生成此画布。\n\n"
             f"配置：{config_path}",
         )
     )
@@ -221,7 +238,9 @@ def build_visual_workflow(
 
     identity_node_ids: dict[str, int] = {}
     identity_inputs = list(dict.fromkeys(
-        str(spec.get("identity_input", identity_input)) for spec in chain_specs
+        str(spec["identity_input"] if "identity_input" in spec else identity_input)
+        for spec in chain_specs
+        if (spec["identity_input"] if "identity_input" in spec else identity_input)
     ))
     for index, current_identity_input in enumerate(identity_inputs):
         node_id = 30 + index
@@ -234,6 +253,18 @@ def build_visual_workflow(
         image_node["widgets_values"] = [current_identity_input, "image"]
         canvas.add(image_node)
         identity_node_ids[current_identity_input] = node_id
+
+    bgm_node_id: int | None = None
+    if bgm_input:
+        bgm_node_id = 25
+        bgm = _reset_node(
+            _template_node(base, "LoadAudio", node_id=22),
+            bgm_node_id,
+            (-2350, 1450),
+            "独立 BGM · 最终混音闪避",
+        )
+        bgm["widgets_values"] = [bgm_input, None, None]
+        canvas.add(bgm)
 
     voice_node_ids: dict[str, int] = {}
     for index, (voice_key, voice_input) in enumerate(voice_inputs):
@@ -285,8 +316,10 @@ def build_visual_workflow(
         canvas.connect(11, 0, sampler_id, "clip", "CLIP")
         canvas.connect(12, 0, sampler_id, "video_vae", "VAE")
         canvas.connect(13, 0, sampler_id, "audio_vae", "VAE")
-        current_identity_input = str(spec.get("identity_input", identity_input))
-        canvas.connect(identity_node_ids[current_identity_input], 0, sampler_id, "reference_images", "IMAGE")
+        raw_identity_input = spec["identity_input"] if "identity_input" in spec else identity_input
+        current_identity_input = str(raw_identity_input) if raw_identity_input else ""
+        if current_identity_input:
+            canvas.connect(identity_node_ids[current_identity_input], 0, sampler_id, "reference_images", "IMAGE")
         for voice_index, voice_key in enumerate(spec.get("voice_keys", [])[:3]):
             if voice_key in voice_node_ids:
                 input_name = "voice_ref" if voice_index == 0 else f"voice_ref_{voice_index + 1}"
@@ -354,11 +387,13 @@ def build_visual_workflow(
     canvas.connect(400, 0, 402, "video", "VIDEO")
     canvas.connect(402, 1, 403, "audio", "AUDIO")
 
-    assembler = _story_assembler_node(404, (720, 840), "精准时轴：旁白、对白、字幕与环境声", config_path)
+    assembler = _story_assembler_node(404, (720, 840), "精准时轴：旁白、对白、BGM 与环境声", config_path)
     canvas.add(assembler)
     for index, merge_id in enumerate(chain_merge_ids):
         input_name = "path_a" if index == 0 else f"path_{chr(ord('a') + index)}"
         canvas.connect(merge_id, 1, 404, input_name, "STRING")
+    if bgm_node_id is not None:
+        canvas.connect(bgm_node_id, 0, 404, "bgm", "AUDIO")
     delivery_save = _reset_node(_template_node(base, "SaveVideo", node_id=27), 405, (1210, 820), "保存并预览最终发布成片")
     delivery_save["widgets_values"] = [f"video/workflow2/{slug}/{slug}_delivery_preview", "auto", "auto"]
     canvas.add(delivery_save)

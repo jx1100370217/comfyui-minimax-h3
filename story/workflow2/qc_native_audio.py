@@ -57,7 +57,7 @@ def run_qc(
     config = json.loads(config_path.read_text())
     report_path = report_path or config_path.with_name("audio_qc.json")
     video = config.get("video", {})
-    shot_duration = video.get("frames_per_shot", config.get("frames_per_shot", 243)) / video.get("fps", config.get("fps", 24))
+    shot_duration = video.get("frames_per_shot", config.get("frames_per_shot", 362)) / video.get("fps", config.get("fps", 24))
     scene_to_chain = {}
     for chain_index, scene_ids in enumerate(config["chains"], start=1):
         for within_chain, scene_id in enumerate(scene_ids):

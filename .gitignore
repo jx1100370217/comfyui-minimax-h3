@@ -22,19 +22,17 @@ venv*/
 web_custom_versions/
 .DS_Store
 filtered-openapi.yaml
-uv.lock
-.comfy_environment
 
-# Workflow2 local projects: story/script JSON, identity and voice references,
-# generated workflow canvases, render runs, and finished media stay local.
+# Workflow2 source is shareable; story configs and generated media stay local.
 /story/workflow2/stories/
 /story/workflow2/runs/
-/story/workflow2/narration/
-/story/workflow2/voice_refs/
-/story/workflow2/dialogue_fallback/
-/story/workflow2/audio_spines/
 /story/workflow2/final/
-/story/workflow2/*.json
-/story/workflows/
-/input/story_workflow2/
-/user/default/workflows/MiniMax-H3-Workflow2/
+/story/workflow2/narration/
+/story/workflow2/dialogue_fallback/
+/story/workflow2/voice_refs/
+/story/workflow2/audio_qc.json
+/story/workflow2/comfyui_workflow2.log
+/story/workflow2/sequential_rerun.log
+/story/workflows/workflow2/
+uv.lock
+.comfy_environment

@@ -12,12 +12,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import re
 import shutil
 import subprocess
 import time
+from urllib.parse import unquote, urlparse
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
@@ -36,6 +38,9 @@ UNET = "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 CLIP = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+WORKFLOW_SIGNATURE_VERSION = 4
+SHARED_IDENTITY_REFERENCE = (ROOT / "input" / "story_workflow2" / "identity_reference.png").resolve()
+DEFAULT_IDENTITY_REGISTRY = WORK_DIR / "identity_registry.json"
 
 
 @dataclass
@@ -50,11 +55,11 @@ class RuntimePaths:
     final_dir: Path
     workflows_dir: Path
     assets_dir: Path
-    identity_source: Path
+    identity_source: Path | None
     identity_name: str
     voice_ref_dir: Path
     audio_qc_path: Path
-    comfy_identity_ref: str
+    comfy_identity_ref: str | None
     comfy_voice_refs: dict[str, str] = field(default_factory=dict)
 
 
@@ -99,7 +104,9 @@ def video_frame_info(path: Path) -> tuple[int, float]:
 def build_scene_timeline(config: dict, chain_paths: list[Path]) -> list[dict[str, float | int]]:
     """Map every scene to exact video-frame boundaries in the H3 chain masters.
 
-    H3's multishot master keeps one shared frame at every internal chain cut.
+    H3's multishot master normally keeps one shared frame at every internal
+    chain cut; some streamed masters also drop the cut-adjacent terminal
+    frame during muxing.
     Audio used to be placed with ``master_duration / scene_count``; that makes
     narration and dialogue drift whenever a chain contains more than one shot.
     This function derives the timeline from the actual video frames instead.
@@ -107,7 +114,7 @@ def build_scene_timeline(config: dict, chain_paths: list[Path]) -> list[dict[str
     if len(chain_paths) != len(config["chains"]):
         raise ValueError("chain path count must match config.chains")
     target_fps = float(video_value(config, "fps", 24))
-    frames_per_shot = int(video_value(config, "frames_per_shot", 243))
+    frames_per_shot = int(video_value(config, "frames_per_shot", 362))
     global_frame = 0
     timeline: list[dict[str, float | int]] = []
 
@@ -120,9 +127,13 @@ def build_scene_timeline(config: dict, chain_paths: list[Path]) -> list[dict[str
         shot_count = len(scene_ids)
         expected_frames = shot_count * frames_per_shot
         overlap_total = expected_frames - actual_frames
-        if overlap_total < 0 or (shot_count == 1 and overlap_total != 0) or (shot_count > 1 and overlap_total > shot_count - 1):
+        # A single streamed component may lose one terminal frame during muxing;
+        # a multishot chain may additionally lose one shared and one terminal
+        # frame at each internal cut.
+        max_cut_frames = max(1, 2 * max(0, shot_count - 1))
+        if overlap_total < 0 or overlap_total > max_cut_frames:
             raise RuntimeError(
-                f"Chain {chain_index} has {actual_frames} frames; expected {expected_frames} minus at most one shared frame per cut"
+                f"Chain {chain_index} has {actual_frames} frames; expected {expected_frames} with at most two cut-adjacent frames removed per cut"
             )
         boundary_count = max(0, shot_count - 1)
         boundary_overlaps = [
@@ -152,6 +163,54 @@ def build_scene_timeline(config: dict, chain_paths: list[Path]) -> list[dict[str
             local_frame = next_local_frame
         global_frame += actual_frames
     return timeline
+
+
+def normalize_chain_paths(config: dict, paths: RuntimePaths, chain_paths: list[Path]) -> list[Path]:
+    """Trim tiny mux-length overshoots before timeline and final concatenation.
+
+    H3 streamed masters can contain one extra terminal frame per component
+    (for example 722 instead of 720 frames for a two-shot chain).  Keeping
+    those frames shifts every later narration cue, so normalize only this
+    bounded transport artifact and leave intentional short-chain overlap
+    handling to ``build_scene_timeline``.
+    """
+    fps = float(video_value(config, "fps", 24))
+    frames_per_shot = int(video_value(config, "frames_per_shot", 362))
+    output_dir = paths.final_dir / "normalized_chains"
+    normalized: list[Path] = []
+    for chain_index, (scene_ids, source) in enumerate(zip(config["chains"], chain_paths), start=1):
+        actual_frames, actual_fps = video_frame_info(source)
+        expected_frames = len(scene_ids) * frames_per_shot
+        excess = actual_frames - expected_frames
+        max_overshoot = max(1, 2 * max(0, len(scene_ids) - 1))
+        if excess <= 0 or excess > max_overshoot:
+            normalized.append(source)
+            continue
+        destination = output_dir / f"chain_{chain_index:02d}.mp4"
+        needs_render = not destination.exists() or destination.stat().st_mtime_ns < source.stat().st_mtime_ns
+        if not needs_render:
+            try:
+                needs_render = video_frame_info(destination)[0] != expected_frames
+            except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError):
+                needs_render = True
+        if needs_render:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            duration = expected_frames / fps
+            filter_complex = (
+                f"[0:v]trim=start_frame=0:end_frame={expected_frames},setpts=PTS-STARTPTS[v];"
+                f"[0:a]atrim=start=0:end={duration:.6f},asetpts=PTS-STARTPTS[a]"
+            )
+            run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+                "-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-r", f"{fps:.6f}", "-frames:v", str(expected_frames),
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart", str(destination),
+            ])
+        print(f"NORMALIZE CHAIN {chain_index:02d}: {actual_frames}->{expected_frames} frames", flush=True)
+        normalized.append(destination)
+    return normalized
 
 
 def valid_video(path: Path, minimum: float) -> bool:
@@ -201,8 +260,288 @@ def style_value(config: dict, key: str, default: str) -> str:
     return str(style.get(key, default))
 
 
+def prompting_value(config: dict, key: str, default: str) -> str:
+    """Read optional story-direction text shared by every H3 shot.
+
+    Keeping screenplay and dialogue direction in the generic runner means a
+    new story only supplies its narrative material; the same film-language,
+    blocking, and speaker discipline is automatically applied to every shot.
+    """
+    prompting = config.get("prompting", {})
+    if isinstance(prompting, str):
+        return prompting if key == "screenplay" else default
+    if not isinstance(prompting, dict):
+        return default
+    return str(prompting.get(key, default))
+
+
+def render_signature(config: dict, scene_ids: list[int]) -> str:
+    """Fingerprint the prompt and sampler inputs so stale H3 clips cannot be reused."""
+    scenes_by_id = {int(scene["id"]): scene for scene in config.get("scenes", [])}
+    payload = {
+        "version": WORKFLOW_SIGNATURE_VERSION,
+        "model": [UNET, CLIP, VIDEO_VAE, AUDIO_VAE],
+        "seed": config.get("seed"),
+        "video": config.get("video", {}),
+        "width": config.get("width"),
+        "height": config.get("height"),
+        "fps": config.get("fps"),
+        "frames_per_shot": config.get("frames_per_shot"),
+        "steps": config.get("steps"),
+        "sampler": config.get("sampler"),
+        "scheduler": config.get("scheduler"),
+        "style": config.get("style", {}),
+        "prompting": config.get("prompting", {}),
+        "generation": config.get("generation", {}),
+        "identity_policy": config.get("identity_policy", {}),
+        "identity_namespace": identity_namespace(config),
+        "identity_references": config.get("assets", {}).get("identity_references", {}),
+        "subjects": normalize_subjects(config),
+        "voice_references": config.get("voice_references", {}),
+        "scenes": [scenes_by_id[int(scene_id)] for scene_id in scene_ids],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def signature_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".workflow2.signature")
+
+
+def signature_matches(path: Path, signature: str) -> bool:
+    if not path.exists():
+        return False
+    marker = signature_path(path)
+    try:
+        return marker.read_text().strip() == signature
+    except OSError:
+        return False
+
+
+def write_signature(path: Path, signature: str) -> None:
+    signature_path(path).write_text(signature + "\n")
+
+
 def config_slug(config: dict) -> str:
     return slugify(str(config.get("slug") or config.get("title") or "story"))
+
+
+def identity_policy(config: dict) -> dict:
+    policy = config.get("identity_policy", {})
+    return policy if isinstance(policy, dict) else {}
+
+
+def identity_namespace(config: dict) -> str:
+    """Return the stable visual-cast namespace for one story project."""
+    policy = identity_policy(config)
+    return str(policy.get("namespace") or f"story:{config_slug(config)}")
+
+
+def resolve_asset_path(value: str | Path, config: dict, config_path: Path) -> Path:
+    assets = config.get("assets", {}) if isinstance(config.get("assets", {}), dict) else {}
+    resolved = resolve_project_path(value, config_path)
+    if not resolved.exists():
+        assets_dir = resolve_project_path(assets.get("directory", "input/story_workflow2"), config_path)
+        candidate = assets_dir / str(value)
+        if candidate.exists():
+            resolved = candidate
+    return resolved
+
+
+def configured_identity_sources(config: dict, config_path: Path) -> list[tuple[str, Path]]:
+    assets = config.get("assets", {}) if isinstance(config.get("assets", {}), dict) else {}
+    sources: list[tuple[str, Path]] = []
+    combined = assets.get("identity_reference")
+    if combined:
+        sources.append(("__combined__", resolve_asset_path(combined, config, config_path)))
+    references = assets.get("identity_references", {})
+    if isinstance(references, dict):
+        for subject_id, value in references.items():
+            if value:
+                sources.append((str(subject_id), resolve_asset_path(value, config, config_path)))
+    return sources
+
+
+def is_legacy_shared_identity_value(config: dict, value: str | Path) -> bool:
+    if "identity_policy" in config:
+        return False
+    candidate = Path(value)
+    candidates = [candidate] if candidate.is_absolute() else [ROOT / candidate, ROOT / "input" / "story_workflow2" / candidate]
+    return any(path.resolve() == SHARED_IDENTITY_REFERENCE for path in candidates)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _known_identity_sources(config_path: Path) -> list[tuple[str, str, Path]]:
+    """Read existing story configs to catch copied portraits, including legacy configs."""
+    records: list[tuple[str, str, Path]] = []
+    story_dir = WORK_DIR / "stories"
+    if not story_dir.exists():
+        return records
+    for candidate in sorted(story_dir.glob("*.json")):
+        if candidate.resolve() == config_path.resolve():
+            continue
+        try:
+            other = json.loads(candidate.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        namespace = identity_namespace(other)
+        for subject_id, source in configured_identity_sources(other, candidate):
+            if source.exists() and source.is_file():
+                records.append((namespace, subject_id, source))
+    return records
+
+
+def validate_story_identity_policy(config: dict, config_path: Path | None = None) -> None:
+    """Require story-local, non-reused cast assets for newly authored projects."""
+    policy = config.get("identity_policy")
+    if policy is None:
+        return  # Legacy projects remain readable; their generic fallback is ignored at staging time.
+    if not isinstance(policy, dict):
+        raise ValueError("identity_policy must be an object")
+    if str(policy.get("scope", "story")) != "story":
+        raise ValueError("identity_policy.scope must be 'story'")
+    if not bool(policy.get("require_unique_story_cast", True)):
+        raise ValueError("identity_policy.require_unique_story_cast must remain true")
+    expected_namespace = f"story:{config_slug(config)}"
+    if identity_namespace(config) != expected_namespace:
+        raise ValueError(f"identity_policy.namespace must be {expected_namespace!r}")
+    subjects = normalize_subjects(config)
+    if not subjects:
+        raise ValueError("identity_policy requires at least one subject")
+    keys = [str(subject.get("identity_key", "")).strip() for subject in subjects]
+    if any(not key for key in keys):
+        raise ValueError("every subject in a unique story cast requires identity_key")
+    if len(keys) != len(set(keys)):
+        raise ValueError("subject identity_key values must be unique within a story")
+    if any(not key.startswith(f"{config_slug(config)}:") for key in keys):
+        raise ValueError("subject identity_key must be namespaced by the story slug")
+    if config_path is None:
+        return
+    assets = config.get("assets", {}) if isinstance(config.get("assets", {}), dict) else {}
+    assets_dir = resolve_project_path(assets.get("directory", "input/story_workflow2"), config_path).resolve()
+    configured_references = assets.get("identity_references", {})
+    if not assets.get("identity_reference") and isinstance(configured_references, dict):
+        dangling = [
+            subject["id"] for subject in subjects
+            if "reference_picture" in subject and subject["id"] not in configured_references
+        ]
+        if dangling:
+            raise ValueError(
+                "subjects with reference_picture require a matching story-local assets.identity_references entry: "
+                + ", ".join(dangling)
+            )
+    local_records: list[tuple[str, Path]] = []
+    for subject_id, source in configured_identity_sources(config, config_path):
+        if not source.exists() or not source.is_file():
+            raise ValueError(f"identity reference for {subject_id} does not exist: {source}")
+        if not _is_relative_to(source, assets_dir):
+            raise ValueError(
+                f"identity reference for {subject_id} must live inside this story's asset directory {assets_dir}: {source}"
+            )
+        local_records.append((subject_id, source.resolve()))
+    known = _known_identity_sources(config_path)
+    for subject_id, source in local_records:
+        digest = file_sha256(source)
+        for other_namespace, other_subject, other_source in known:
+            if file_sha256(other_source) == digest and other_namespace != identity_namespace(config):
+                raise ValueError(
+                    f"identity reference {source} reuses the {other_namespace}/{other_subject} portrait; "
+                    "each story must have its own cast"
+                )
+    registry_value = policy.get("registry", str(DEFAULT_IDENTITY_REGISTRY.relative_to(ROOT)))
+    registry_path = resolve_project_path(registry_value, config_path)
+    if registry_path.exists():
+        try:
+            registry = json.loads(registry_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"identity registry is not valid JSON: {registry_path}") from exc
+        for item in registry.get("references", []):
+            if not isinstance(item, dict) or item.get("namespace") == identity_namespace(config):
+                continue
+            if any(str(item.get("sha256")) == file_sha256(source) for _, source in local_records):
+                raise ValueError(
+                    f"identity reference {source} is already registered to another story: {item.get('namespace')}"
+                )
+
+
+def write_story_identity_manifest(config: dict, paths: RuntimePaths) -> Path:
+    """Persist a human-readable, story-scoped cast card used by future renders/QC."""
+    subjects = normalize_subjects(config)
+    assets = config.get("assets", {}) if isinstance(config.get("assets", {}), dict) else {}
+    references = assets.get("identity_references", {})
+    manifest = {
+        "version": 1,
+        "namespace": identity_namespace(config),
+        "title": str(config.get("title", "")),
+        "policy": identity_policy(config) or {"legacy": True, "shared_reference_ignored": True},
+        "subjects": [
+            {
+                "id": subject["id"],
+                "identity_key": subject.get("identity_key") or f"{config_slug(config)}:{subject['id']}",
+                "description": subject["description"],
+                "reference_configured": subject["id"] in references if isinstance(references, dict) else False,
+            }
+            for subject in subjects
+        ],
+        "rules": [
+            "Never reuse a face, body, hair, costume palette, prop signature, or voice identity from another story.",
+            "Create missing characters from this story's written traits; use references only from this story's asset directory.",
+            "A reference image is an identity anchor, not permission to import its background people or props.",
+        ],
+    }
+    destination = paths.run_dir / "story_identity.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    return destination
+
+
+def register_story_identity(config: dict, paths: RuntimePaths) -> None:
+    """Record the cast namespace and reference hashes for future collision checks."""
+    policy = identity_policy(config)
+    if not policy or not bool(policy.get("require_unique_story_cast", True)):
+        return
+    registry_value = policy.get("registry", str(DEFAULT_IDENTITY_REGISTRY.relative_to(ROOT)))
+    registry_path = resolve_project_path(registry_value, paths.config_path)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        registry = json.loads(registry_path.read_text()) if registry_path.exists() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"identity registry is not valid JSON: {registry_path}") from exc
+    registry.setdefault("version", 1)
+    registry.setdefault("stories", [])
+    registry.setdefault("references", [])
+    namespace = identity_namespace(config)
+    registry["stories"] = [item for item in registry["stories"] if item.get("namespace") != namespace]
+    registry["stories"].append({
+        "namespace": namespace,
+        "title": str(config.get("title", "")),
+        "subject_keys": [subject.get("identity_key") for subject in normalize_subjects(config)],
+    })
+    registry["references"] = [item for item in registry["references"] if item.get("namespace") != namespace]
+    for subject_id, source in configured_identity_sources(config, paths.config_path):
+        if source.exists() and source.is_file():
+            registry["references"].append({
+                "namespace": namespace,
+                "subject_id": subject_id,
+                "path": str(source.resolve()),
+                "sha256": file_sha256(source),
+            })
+    registry_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n")
 
 
 def build_paths(config: dict, config_path: Path) -> RuntimePaths:
@@ -210,16 +549,20 @@ def build_paths(config: dict, config_path: Path) -> RuntimePaths:
     run_dir = resolve_project_path(config.get("run_dir", f"story/workflow2/runs/{slug}"), config_path)
     assets = config.get("assets", {})
     assets_dir = resolve_project_path(assets.get("directory", "input/story_workflow2"), config_path)
-    identity_value = assets.get("identity_reference", "identity_reference.png")
-    identity_source = resolve_project_path(identity_value, config_path)
-    if not identity_source.exists() and (assets_dir / identity_value).exists():
-        identity_source = assets_dir / identity_value
-    identity_name = Path(identity_value).name
+    identity_value = assets.get("identity_reference")
+    identity_source = resolve_project_path(identity_value, config_path) if identity_value else None
+    if identity_value and not identity_source.exists() and (assets_dir / str(identity_value)).exists():
+        identity_source = assets_dir / str(identity_value)
+    # The former generator pointed every story at this one marketplace portrait.
+    # Keep legacy JSON readable, but never pass that shared fallback into a new render.
+    if identity_source and "identity_policy" not in config and not _is_relative_to(identity_source, assets_dir):
+        identity_source = None
+    identity_name = Path(identity_value).name if identity_source and identity_value else ""
     workflows_dir = resolve_project_path(
         config.get("workflows_dir", f"story/workflows/workflow2/{slug}"), config_path
     )
     identity_suffix = Path(identity_name).suffix.lower() or ".png"
-    identity_stem = slugify(Path(identity_name).stem)
+    identity_stem = slugify(Path(identity_name).stem) if identity_name else ""
     return RuntimePaths(
         config_path=config_path,
         slug=slug,
@@ -238,8 +581,114 @@ def build_paths(config: dict, config_path: Path) -> RuntimePaths:
         # Built-in ComfyUI LoadImage/LoadAudio nodes only enumerate files at
         # the top level of input/.  Story-prefixed names avoid collisions while
         # keeping the assets selectable and valid on the visual canvas.
-        comfy_identity_ref=f"workflow2_{slug}_{identity_stem}{identity_suffix}",
+        comfy_identity_ref=(f"workflow2_{slug}_{identity_stem}{identity_suffix}" if identity_name else None),
     )
+
+
+def resolve_bgm_source(config: dict, paths: RuntimePaths, override: Path | None = None) -> Path | None:
+    """Resolve the optional, separately mixed background-music source.
+
+    A BGM file is deliberately an external source of truth.  The old project
+    generator created a synthetic WAV automatically, which made it too easy
+    to mistake a placeholder bed for the requested period-drama score.  New
+    projects may use ``source_type=download`` and provide a URL; generated
+    beds are accepted only when they explicitly opt in with
+    ``allow_synthetic_fallback``.
+    """
+    setting = config.get("bgm", {})
+    if override is None and (setting is False or not isinstance(setting, dict) or not setting.get("enabled", False)):
+        return None
+    source_type = str(setting.get("source_type", "file")).lower()
+    if source_type in {"none", "off", "disabled"}:
+        return None
+    if source_type == "generated" and not bool(setting.get("allow_synthetic_fallback", False)):
+        raise RuntimeError(
+            "Synthetic BGM is disabled by default; provide bgm.source_type='file' or 'download', "
+            "or explicitly set bgm.allow_synthetic_fallback=true for a temporary placeholder"
+        )
+    if override is not None:
+        source = Path(override).expanduser().resolve()
+    elif source_type == "download":
+        source = ensure_downloaded_bgm(setting, paths)
+    else:
+        configured = setting.get("file")
+        if not configured:
+            raise ValueError("bgm.enabled is true but bgm.file is missing (or use bgm.source_type='download')")
+        source = resolve_project_path(str(configured), paths.config_path)
+        if not source.exists() and (paths.assets_dir / str(configured)).exists():
+            source = (paths.assets_dir / str(configured)).resolve()
+    if not source.is_file():
+        raise RuntimeError(f"Configured BGM does not exist: {source}")
+    return source
+
+
+def ensure_downloaded_bgm(setting: dict, paths: RuntimePaths) -> Path:
+    """Download and cache one declared score without silently replacing it.
+
+    The cache is keyed by the story slug and URL; an optional SHA-256 makes a
+    published workflow reproducible even when a host later replaces a file.
+    Downloads are streamed to a ``.part`` file and promoted atomically only
+    after the checksum and an ffprobe audio-stream check pass.
+    """
+    url = str(setting.get("source_url") or setting.get("url") or "").strip()
+    if not url:
+        raise ValueError("bgm.source_type='download' requires bgm.source_url")
+    parsed = urlparse(url)
+    suffix = Path(unquote(parsed.path)).suffix.lower()
+    if suffix not in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}:
+        suffix = ".audio"
+    cache_dir = paths.assets_dir / "bgm"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    destination = cache_dir / f"download_{cache_key}{suffix}"
+    expected_hash = str(setting.get("sha256") or "").strip().lower()
+    if not destination.exists():
+        temporary = destination.with_suffix(destination.suffix + ".part")
+        try:
+            digest = hashlib.sha256()
+            with requests.get(url, stream=True, timeout=(15, 120), headers={"User-Agent": "Workflow2-BGM/1.0"}) as response:
+                response.raise_for_status()
+                with temporary.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+                            digest.update(chunk)
+            actual_hash = digest.hexdigest()
+            if expected_hash and actual_hash != expected_hash:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(f"Downloaded BGM sha256 mismatch: expected {expected_hash}, got {actual_hash}")
+            temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+    if expected_hash:
+        actual_hash = hashlib.sha256(destination.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise RuntimeError(f"Cached BGM sha256 mismatch: expected {expected_hash}, got {actual_hash}")
+    try:
+        probe = run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(destination)],
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise RuntimeError(f"Downloaded BGM is not a readable audio file: {destination}") from exc
+    if not probe.stdout.strip():
+        raise RuntimeError(f"Downloaded BGM has no audio stream: {destination}")
+    return destination
+
+
+def stage_bgm(config: dict, paths: RuntimePaths, force: bool = False) -> str | None:
+    """Copy the configured BGM into ComfyUI's top-level input directory."""
+    source = resolve_bgm_source(config, paths)
+    if source is None:
+        return None
+    destination = ROOT / "input" / f"workflow2_{paths.slug}_bgm{source.suffix.lower() or '.wav'}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if force or not destination.exists() or destination.stat().st_size != source.stat().st_size or destination.stat().st_mtime_ns < source.stat().st_mtime_ns:
+        if source.resolve() != destination.resolve():
+            shutil.copy2(source, destination)
+    return destination.name
 
 
 def audio_spine_enabled(config: dict, dialogue: dict | None = None) -> bool:
@@ -285,7 +734,7 @@ def stage_audio_spine(
     if not any(scene.get("dialogue") and audio_spine_enabled(config, scene["dialogue"]) for scene in spine_scenes):
         return None
 
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     total = len(spine_scenes) * shot_seconds
     events: list[dict[str, Any]] = []
     for local_index, scene in enumerate(spine_scenes):
@@ -327,6 +776,9 @@ def normalize_subjects(config: dict) -> list[dict]:
             }
             if "reference_picture" in subject:
                 normalized["reference_picture"] = int(subject["reference_picture"])
+            for key in ("identity_key", "identity_traits", "role"):
+                if key in subject and subject[key] is not None:
+                    normalized[key] = str(subject[key])
             result.append(normalized)
     return result
 
@@ -364,10 +816,16 @@ def dialogue_speaker_subject(config: dict, dialogue: dict) -> dict:
 
 def scene_voice_keys(config: dict, scenes: list[dict]) -> list[str]:
     profiles = voice_profiles(config)
-    del scenes
+    requested = {
+        dialogue_speaker_key(config, scene["dialogue"])
+        for scene in scenes
+        if scene.get("dialogue")
+    }
+    if not requested:
+        return []
     subject_order = [item["id"] for item in normalize_subjects(config)]
-    keys = [key for key in subject_order if key in profiles]
-    keys.extend(key for key in profiles if key not in keys)
+    keys = [key for key in subject_order if key in profiles and key in requested]
+    keys.extend(key for key in profiles if key in requested and key not in keys)
     return keys
 
 
@@ -375,6 +833,113 @@ def subject_numbers(config: dict, scene: dict) -> list[int]:
     subjects = normalize_subjects(config)
     requested = set(str(item) for item in scene.get("subject_ids", []))
     return [index + 1 for index, item in enumerate(subjects) if not requested or item["id"] in requested]
+
+
+def scene_subject_entries(config: dict, scene: dict) -> list[tuple[int, dict]]:
+    """Return only the declared cast, retaining the configured subject numbers."""
+    subjects = normalize_subjects(config)
+    requested = {str(item) for item in scene.get("subject_ids", [])}
+    return [
+        (index + 1, subject)
+        for index, subject in enumerate(subjects)
+        if not requested or subject["id"] in requested
+    ]
+
+
+def shot_contract_prompt(config: dict, scene: dict, subject_entries: list[tuple[int, dict]]) -> str:
+    """Build reusable physical-continuity and anatomy constraints for H3."""
+    cast = ", ".join(f"<Subject {number}> ({subject['id']})" for number, subject in subject_entries)
+    lines = [
+        "SHOT INTEGRITY: make this one self-contained, physically continuous take. Use only the listed cast; do not invent, duplicate, merge, or swap people, animals, riders, or props.",
+        "ANATOMY AND OBJECT CONTINUITY: every visible person has exactly two arms and two hands, every visible horse has one coherent body and four anatomically consistent legs, and ropes, reins, crutches, staffs, and clothing remain attached only where physically held or tied. No extra limbs, duplicate hands, fused bodies, floating props, or impossible attachments.",
+        f"CAST LOCK: only {cast or 'the explicitly described subject'} may be visible, including the background and reflections. No unlisted extras, passersby, silhouettes, mannequins, portraits that look alive, or duplicate/partial bodies may appear. Keep each subject's identity, role, costume, scale, and position stable from the first frame to the last.",
+        "CAMERA AND ACTION: use motivated camera motion and real contact, weight, momentum, and cause-and-effect. Do not use an unmotivated montage, time jump, or off-screen action to hide a continuity change.",
+    ]
+    if len(subject_entries) > 1:
+        lines.append(
+            "MULTI-SUBJECT SPATIAL LOCK: assign every listed subject a stable screen lane and depth layer. "
+            "Keep a visible body-width gap unless the shot contract explicitly requires real contact; "
+            "never let one subject pass through another, cross a torso, swap front/back depth ordering, "
+            "or teleport across the frame. If paths would intersect, slow or stop the moving subject and "
+            "stage the action side-by-side with clear occlusion and a complete visible cause-and-effect path."
+        )
+    contract = scene.get("shot_contract")
+    if isinstance(contract, dict):
+        render_strategy = str(contract.get("render_strategy", "")).strip()
+        if render_strategy == "single_subject_safe":
+            lines.append(
+                "SINGLE-SUBJECT SAFETY: render only the first listed subject as a visible human. "
+                "All other story subjects remain off-camera and must not appear as silhouettes, reflections, "
+                "duplicates, partial bodies, or background extras. Keep the visible subject's action continuous "
+                "and use narration to carry any off-camera story information."
+            )
+        primary = str(contract.get("primary_action", "")).strip()
+        if primary:
+            lines.append(f"PRIMARY ACTION: perform exactly this physical event and make its owner unambiguous: {primary}")
+        owner = str(contract.get("action_owner", "")).strip()
+        if owner:
+            lines.append(f"ACTION OWNER: {owner} performs the primary action; no other subject performs or receives it.")
+        rider = str(contract.get("rider", "")).strip()
+        if rider:
+            lines.append(f"RIDER LOCK: {rider}; if this says 'none', no person is mounted, seated on, or falling from a horse.")
+        falling_subject = str(contract.get("falling_subject", "")).strip()
+        if falling_subject:
+            lines.append(f"FALLING SUBJECT LOCK: {falling_subject} is the only subject who falls; all other subjects remain upright and never appear to fall from the horse.")
+        hand_plan = str(contract.get("hand_plan", "")).strip()
+        if hand_plan:
+            lines.append(f"HAND PLAN: {hand_plan}")
+        spatial_plan = str(contract.get("spatial_plan", "")).strip()
+        if spatial_plan:
+            lines.append(f"SPATIAL PLAN: {spatial_plan}")
+        beats = contract.get("beats")
+        if isinstance(beats, list) and beats:
+            beat_lines = []
+            for beat in beats:
+                if isinstance(beat, dict) and beat.get("time") and beat.get("action"):
+                    beat_lines.append(f"{beat['time']}: {beat['action']}")
+            if beat_lines:
+                lines.append("TIMED BEATS (do not reorder or blend): " + " | ".join(beat_lines))
+        forbidden = contract.get("forbidden")
+        if isinstance(forbidden, list) and forbidden:
+            lines.append("FORBIDDEN IN THIS TAKE: " + "; ".join(str(item) for item in forbidden))
+    content = scene.get("content_contract") if isinstance(scene.get("content_contract"), dict) else {}
+    must_show = [str(item).strip() for item in content.get("must_show", []) if str(item).strip()]
+    if not must_show:
+        visual = scene.get("visual_action") or scene.get("visual") or scene.get("visual_description")
+        if visual:
+            must_show = [str(visual).strip()]
+    must_not_show = [str(item).strip() for item in content.get("must_not_show", []) if str(item).strip()]
+    if not must_not_show:
+        must_not_show = [
+            "a decorative still portrait replacing the declared action",
+            "unlisted people, animals, props, speech, or a different story event",
+        ]
+    if must_show:
+        lines.append("NARRATIVE FACTS — MUST SHOW VERBATIM: " + "; ".join(must_show))
+    lines.append("NARRATIVE FACTS — MUST NOT SHOW: " + "; ".join(must_not_show))
+    lines.append(
+        "SEMANTIC ACCEPTANCE: the final frame must still be a recognizable continuation of this exact shot's "
+        "declared action. Do not replace the event with a decorative portrait, establishing still, unrelated "
+        "reaction, flashback, dream, or montage. If an action cannot fit, simplify the camera move while "
+        "preserving the named actor, object, direction, and result."
+    )
+    return "\n".join(lines)
+
+
+def story_identity_prompt(config: dict, subject_entries: list[tuple[int, dict]]) -> str:
+    """Build the hard story-level identity boundary shared by every H3 take."""
+    namespace = identity_namespace(config)
+    cast = []
+    for number, subject in subject_entries:
+        key = subject.get("identity_key") or f"{config_slug(config)}:{subject['id']}"
+        traits = subject.get("identity_traits") or subject["description"]
+        cast.append(f"<Subject {number}> identity_key={key}; role/traits={traits}")
+    return "\n".join([
+        f"STORY IDENTITY NAMESPACE: {namespace}. This namespace is isolated from every other story and prior run.",
+        "STORY CAST UNIQUENESS LOCK: build every character only from the cast below and this story's own reference assets. Never reuse or import a face, hair, body proportions, costume palette, prop signature, background person, or voice identity from another story, including any shared/default identity portrait.",
+        "IDENTITY CONTINUITY: the same identity_key must keep the same face, age, body, hair, costume, accessories, and role in every shot of this story. Different identity_keys must remain visibly different people or entities; never merge, swap, or clone them.",
+        "CAST CARD:\n" + "\n".join(cast),
+    ])
 
 
 def dialogue_end(scene: dict, shot_seconds: float) -> float:
@@ -409,20 +974,41 @@ def build_prompt(config: dict, scene: dict, shot_seconds: float, audio_label_map
     visual = visual or f"Show the story beat clearly and continuously: {scene['narration']}"
     action_timing = scene.get("action_timing", "Maintain continuous motivated motion from the first frame through the final frame.")
     sound_design = scene.get("sound_design", "Use physically synchronized location ambience and Foley for every visible action.")
+    screenplay_direction = prompting_value(
+        config,
+        "screenplay",
+        "SCREENPLAY DIRECTION: Treat this as a finished period-film scene, not a slideshow. Build a clear objective, visible cause-and-effect, reaction beats, and a motivated camera path; preserve spatial geography and let each shot change the dramatic situation.",
+    )
+
+    dialogue_direction = prompting_value(
+        config,
+        "dialogue",
+        "DIALOGUE DIRECTION: Use concise, subtext-rich Chinese dialogue. Every authored line belongs only to its assigned speaker; show a reaction beat before or after it, keep listeners' mouths closed, and never invent extra speech, singing, or lip movement.",
+    )
     visual_style = style_value(
         config,
         "visual",
         "Photorealistic cinematic live-action, natural skin and material detail, physically accurate lighting and motion blur, restrained camera movement, coherent continuity, and a phone-safe vertical composition.",
     )
-    subjects = normalize_subjects(config)
-    subject_ids = subject_numbers(config, scene)
+    all_subjects = normalize_subjects(config)
+    subject_entries = scene_subject_entries(config, scene)
+    subjects = [subject for _, subject in subject_entries]
+    subject_ids = [number for number, _ in subject_entries]
+    if not subject_entries:
+        subject_entries = list(enumerate(all_subjects, start=1))
+        subjects = all_subjects
+        subject_ids = [number for number, _ in subject_entries]
     subject_lines = [
-        f"<Subject {subject_id}> is {subject['description']}, defined by <Picture {int(subject.get('reference_picture', 1))}>."
-        for subject_id, subject in enumerate(subjects, start=1)
+        (
+            f"<Subject {subject_id}> is {subject['description']}, defined by <Picture {int(subject['reference_picture'])}>."
+            if "reference_picture" in subject
+            else f"<Subject {subject_id}> is {subject['description']}; create this non-reference subject only as described."
+        )
+        for subject_id, subject in subject_entries
     ]
     audio_lines = []
     for key, number in sorted(audio_label_map.items(), key=lambda item: item[1]):
-        matching_subject = next((index + 1 for index, item in enumerate(subjects) if item["id"] == key), None)
+        matching_subject = next((index for index, item in subject_entries if item["id"] == key), None)
         if matching_subject:
             audio_lines.append(
                 f"<Audio {number}> is the voice-timbre reference for <Subject {matching_subject}> (S{number})."
@@ -438,10 +1024,8 @@ def build_prompt(config: dict, scene: dict, shot_seconds: float, audio_label_map
         for number in sorted(audio_label_map.values())
     )
     audio_refs_text = " and ".join(f"<Audio {number}>" for number in sorted(audio_label_map.values()))
-    picture_refs_text = " and ".join(
-        f"<Picture {number}>"
-        for number in sorted({int(subject.get("reference_picture", 1)) for subject in subjects})
-    )
+    picture_refs = sorted({int(subject["reference_picture"]) for _, subject in subject_entries if "reference_picture" in subject})
+    picture_refs_text = " and ".join(f"<Picture {number}>" for number in picture_refs) or "the written subject descriptions"
     dialogue = scene.get("dialogue")
     if dialogue:
         key = dialogue_speaker_key(config, dialogue)
@@ -478,14 +1062,53 @@ def build_prompt(config: dict, scene: dict, shot_seconds: float, audio_label_map
         performance = "All visible people communicate through eye movement, hand gestures, walking, and physical action. Keep their lips naturally closed; no unscripted speech or singing."
     return "\n\n".join(
         [
-            "subject_definitions:\n" + "\n".join(subject_lines + audio_lines),
+            "subject_definitions:\n" + story_identity_prompt(config, subject_entries) + "\n" + "\n".join(subject_lines + audio_lines),
             f"summary:\n[reference generation + audio reference] Native 9:16 portrait story beat {scene_id}, approximately {shot_seconds:.1f} seconds at {int(video_value(config, 'fps', 24))} fps, using {picture_refs_text} for identity and costume continuity and {audio_refs_text} for voice-timbre reference. Continuous physical motion fills a phone-safe vertical composition.",
             "retention_analysis:\n" + "\n".join(retention_lines),
-            f"detailed_description:\n{visual_style}\n[Shot 1] {visual}\nAction timeline: {action_timing}\n{performance}",
+            f"detailed_description:\n{screenplay_direction}\n{dialogue_direction}\n{visual_style}\n"
+            f"SCENE TRUTH: narration is context only; render exactly the visible action below and do not invent a different event.\n"
+            f"[Shot 1] {visual}\nAction timeline: {action_timing}\n{performance}\n{shot_contract_prompt(config, scene, subject_entries)}",
             f"overall_soundscape: {sound_design} {style_value(config, 'soundscape', 'Sound layers remain separated, naturally dynamic, and synchronized to visible causes.')}",
             f"non_diegetic_music: {style_value(config, 'music', 'N/A')}",
         ]
     )
+
+
+def write_scene_manifest(config: dict, paths: RuntimePaths) -> Path:
+    """Persist the exact narrative contract used by every H3 prompt.
+
+    This sidecar is intentionally human-readable: it lets a producer compare
+    narration, declared visible action, cast, dialogue owner, and forbidden
+    content before spending GPU time, and gives later QC one authoritative
+    source instead of reverse-engineering a generated MP4.
+    """
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
+    manifest = []
+    for scene in config["scenes"]:
+        keys = scene_voice_keys(config, [scene])
+        audio_label_map = {key: index + 1 for index, key in enumerate(keys)}
+        manifest.append({
+            "scene_id": int(scene["id"]),
+            "subject_ids": [str(item) for item in scene.get("subject_ids", [])],
+            "narration": str(scene["narration"]),
+            "visual_action": str(scene.get("visual_action") or scene.get("visual") or scene.get("visual_description") or ""),
+            "content_contract": scene.get("content_contract", {}),
+            "shot_contract": scene.get("shot_contract", {}),
+            "dialogue": scene.get("dialogue"),
+            "duration_seconds": shot_seconds,
+            "prompt": build_prompt(config, scene, shot_seconds, audio_label_map),
+        })
+    destination = paths.run_dir / "scene_manifest.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({
+        "workflow_signature_version": WORKFLOW_SIGNATURE_VERSION,
+        "title": config["title"],
+        "identity_namespace": identity_namespace(config),
+        "identity_policy": identity_policy(config) or {"legacy": True, "shared_reference_ignored": True},
+        "generation": config.get("generation", {}),
+        "scenes": manifest,
+    }, ensure_ascii=False, indent=2) + "\n")
+    return destination
 
 
 def validate_config(config: dict) -> None:
@@ -501,12 +1124,48 @@ def validate_config(config: dict) -> None:
     flattened = [int(scene_id) for chain in chains for scene_id in chain]
     if flattened != scene_ids:
         raise ValueError("config.chains must list every scene id exactly once, in scene order")
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    bgm = config.get("bgm", {})
+    if bgm is not False and isinstance(bgm, dict) and bgm.get("enabled", False):
+        source_type = str(bgm.get("source_type", "file")).lower()
+        if source_type == "download" and not str(bgm.get("source_url") or bgm.get("url") or "").strip():
+            raise ValueError("bgm.source_type='download' requires a non-empty bgm.source_url")
+        if source_type == "file" and not str(bgm.get("file") or "").strip():
+            raise ValueError("bgm.source_type='file' requires bgm.file")
+        if source_type == "generated" and not bool(bgm.get("allow_synthetic_fallback", False)):
+            raise ValueError("bgm.source_type='generated' requires explicit bgm.allow_synthetic_fallback=true")
+        if source_type not in {"file", "download", "generated", "none", "off", "disabled"}:
+            raise ValueError(f"Unsupported bgm.source_type: {source_type}")
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
+    known_subject_ids = {subject["id"] for subject in normalize_subjects(config)}
     for scene in scenes:
         for key in ("id", "narration", "narration_offset", "action_timing", "sound_design"):
             if key not in scene:
                 raise ValueError(f"scene {scene.get('id')} missing {key}")
+        if not (scene.get("visual_action") or scene.get("visual") or scene.get("visual_description")):
+            raise ValueError(f"scene {scene.get('id')} must declare visual_action (the narrative acceptance target)")
         dialogue = scene.get("dialogue")
+        declared_subject_ids = [str(item) for item in scene.get("subject_ids", [])]
+        if len(declared_subject_ids) != len(set(declared_subject_ids)):
+            raise ValueError(f"scene {scene['id']} subject_ids contains duplicates")
+        unknown_subject_ids = sorted(set(declared_subject_ids) - known_subject_ids)
+        if unknown_subject_ids:
+            raise ValueError(f"scene {scene['id']} references unknown subjects: {unknown_subject_ids}")
+        contract = scene.get("shot_contract")
+        if contract is not None:
+            if not isinstance(contract, dict):
+                raise ValueError(f"scene {scene['id']} shot_contract must be an object")
+            for key in ("action_owner", "rider", "falling_subject"):
+                value = contract.get(key)
+                if value and str(value).lower() not in {"none", "无", "n/a"} and str(value) not in known_subject_ids:
+                    raise ValueError(f"scene {scene['id']} shot_contract.{key} references unknown subject {value!r}")
+                if value and str(value).lower() not in {"none", "无", "n/a"} and declared_subject_ids and str(value) not in declared_subject_ids:
+                    raise ValueError(f"scene {scene['id']} shot_contract.{key} must be listed in scene.subject_ids")
+            beats = contract.get("beats")
+            if beats is not None and (not isinstance(beats, list) or any(
+                not isinstance(beat, dict) or not beat.get("time") or not beat.get("action")
+                for beat in beats
+            )):
+                raise ValueError(f"scene {scene['id']} shot_contract.beats must contain time/action objects")
         if dialogue:
             if not dialogue.get("text") or "start" not in dialogue or not dialogue.get("speaker"):
                 raise ValueError(f"scene {scene['id']} dialogue requires speaker, text, and start")
@@ -549,31 +1208,51 @@ def graph_for_chain(
     if len(keys) > 3:
         raise ValueError(f"chain {chain_index} references more than three voice profiles: {keys}")
     audio_label_map = {key: index + 1 for index, key in enumerate(keys)}
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     script = "\n---\n".join(build_prompt(config, scene, shot_seconds, audio_label_map) for scene in chain_scenes)
+    generation = config.get("generation", {}) if isinstance(config.get("generation", {}), dict) else {}
+    continuity = str(generation.get("continuity", "cut"))
+    if continuity == "context_pin" and not bool(generation.get("motion_context_installed", False)):
+        raise RuntimeError(
+            "generation.continuity='context_pin' requires ComfyUI-H3-Motion-Context; "
+            "set generation.continuity='first_frame' or 'cut' when that pack is unavailable"
+        )
     graph = {
         "1": {"class_type": "H3ModelLoaderAny", "inputs": {"model_name": UNET, "activation_reserve_gb": 6.0}},
         "2": {"class_type": "H3ClipLoaderAny", "inputs": {"clip_name": CLIP, "type": "minimax", "mmproj_name": "(auto)"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": VIDEO_VAE}},
         "4": {"class_type": "VAELoader", "inputs": {"vae_name": AUDIO_VAE}},
-        "5": {"class_type": "LoadImage", "inputs": {"image": paths.comfy_identity_ref}},
         "6": {
             "class_type": "H3MultishotMemorySampler",
             "inputs": {
                 "model": ["1", 0], "clip": ["2", 0], "video_vae": ["3", 0], "audio_vae": ["4", 0],
                 "script": script, "shot_count": 0,
                 "width": int(video_value(config, "width", 768)), "height": int(video_value(config, "height", 1344)),
-                "frames_per_shot": int(video_value(config, "frames_per_shot", 243)),
+                "frames_per_shot": int(video_value(config, "frames_per_shot", 362)),
                 "seed": int(config.get("seed", 920260901)) + chain_index * 104729,
                 "steps": int(video_value(config, "steps", 14)), "seed_per_shot": True, "memory_frames": 0,
-                "anchor_frames": 1, "start_image": ["5", 0], "sampler_name": video_value(config, "sampler", "euler"),
-                "scheduler": video_value(config, "scheduler", "beta57"), "bank_pinned": 1, "chain_gain_control": "off",
-                "continuity": "cut", "bank_clip_frames": 22, "color_level": "off", "join_anchor_noise": 0.0,
-                "join_blend": False, "handoff_release": 0.30, "bank_ref_noise": 0.0, "end_anchor": False,
-                "join_fx": "off", "audio_lock": False, "handoff_taper": 0, "handoff_depth": "block",
-                "self_anchor_voice": False, "reference_image_size": "match", "preview_first_shot": True,
+                "anchor_frames": 1, "sampler_name": video_value(config, "sampler", "euler"),
+                "scheduler": video_value(config, "scheduler", "beta57"),
+                "bank_pinned": int(generation.get("bank_pinned", 1)),
+                "chain_gain_control": str(generation.get("chain_gain_control", "off")),
+                "continuity": continuity,
+                "bank_clip_frames": int(generation.get("bank_clip_frames", 22)),
+                "color_level": str(generation.get("color_level", "off")),
+                "join_anchor_noise": float(generation.get("join_anchor_noise", 0.0)),
+                "join_blend": bool(generation.get("join_blend", False)),
+                "handoff_release": float(generation.get("handoff_release", 0.30)),
+                "bank_ref_noise": float(generation.get("bank_ref_noise", 0.0)),
+                "end_anchor": bool(generation.get("end_anchor", False)),
+                "join_fx": "off", "audio_lock": bool(generation.get("audio_lock", False)),
+                "handoff_taper": int(generation.get("handoff_taper", 0)),
+                "handoff_depth": str(generation.get("handoff_depth", "block")),
+                "self_anchor_voice": bool(generation.get("self_anchor_voice", False)),
+                "reference_image_size": "match", "preview_first_shot": True,
                 "save_every_shot": True, "output_scale": 1.0, "upscale_model_name": "(none)",
-                "master_normalize": "luma+contrast", "pin_frames": "22", "pin_noise": 0.0, "pin_renorm": False,
+                "master_normalize": str(generation.get("master_normalize", "luma+contrast")),
+                "pin_frames": str(generation.get("pin_frames", "22")),
+                "pin_noise": float(generation.get("pin_noise", 0.0)),
+                "pin_renorm": bool(generation.get("pin_renorm", False)),
                 "reference_subjects": str(config.get("assets", {}).get("reference_subjects", "")), "low_ram_master": True, "audio_pin_frames": 0, "pin_noise_audio": False,
                 "audio_tone_control": False, "x0_texture_clamp": 0.0, "refresh_renoise": False, "pin_noise_ramp": False,
                 "auto_chunk_ffn": True, "x0_clamp_window": 0.30, "sampler_2": "(off)", "sampler_2_at": 0.40,
@@ -581,6 +1260,9 @@ def graph_for_chain(
         },
         "7": {"class_type": "SaveAudio", "inputs": {"audio": ["6", 1], "filename_prefix": f"workflow2/{paths.slug}/native_chain_{chain_index:02d}_audio"}},
     }
+    if paths.comfy_identity_ref:
+        graph["5"] = {"class_type": "LoadImage", "inputs": {"image": paths.comfy_identity_ref}}
+        graph["6"]["inputs"]["start_image"] = ["5", 0]
     for node_id, key in zip((8, 9, 10), keys):
         graph[str(node_id)] = {"class_type": "LoadAudio", "inputs": {"audio": paths.comfy_voice_refs[key]}}
         input_name = "voice_ref" if node_id == 8 else f"voice_ref_{node_id - 7}"
@@ -620,6 +1302,8 @@ def ensure_server(base_url: str) -> None:
 
 
 def stage_identity(paths: RuntimePaths) -> None:
+    if paths.identity_source is None:
+        return
     if not paths.identity_source.exists():
         raise RuntimeError(f"Configured identity reference does not exist: {paths.identity_source}")
     destination = ROOT / "input" / paths.comfy_identity_ref
@@ -636,11 +1320,19 @@ def stage_subject_identity_references(config: dict, paths: RuntimePaths) -> dict
     voice, mouth motion, and identity cannot migrate to a second person.
     """
     configured = config.get("assets", {}).get("identity_references", {})
+    if not isinstance(configured, dict):
+        raise RuntimeError("assets.identity_references must be an object mapping subject ids to files")
     staged: dict[str, str] = {}
     for subject_id, configured_path in configured.items():
         source = resolve_project_path(configured_path, paths.config_path)
         if not source.exists() and (paths.assets_dir / str(configured_path)).exists():
             source = paths.assets_dir / str(configured_path)
+        if "identity_policy" not in config and not _is_relative_to(source, paths.assets_dir):
+            print(
+                f"IDENTITY POLICY: ignoring external legacy portrait for {subject_id}; using this story's written character traits",
+                flush=True,
+            )
+            continue
         if not source.exists():
             raise RuntimeError(f"Configured identity reference for {subject_id} does not exist: {source}")
         suffix = source.suffix.lower() or ".png"
@@ -665,7 +1357,23 @@ def speaker_locked_dialogue_config(config: dict, scene: dict) -> tuple[dict, dic
     local_dialogue["speaker_lock"] = True
 
     local_config = copy.deepcopy(config)
-    local_config["subjects"] = [{**speaker_subject, "reference_picture": 1}]
+    identity_references = config.get("assets", {}).get("identity_references", {})
+    configured_reference = identity_references.get(speaker_key) if isinstance(identity_references, dict) else None
+    assets_setting = config.get("assets", {}) if isinstance(config.get("assets", {}), dict) else {}
+    assets_root = Path(str(assets_setting.get("directory", "input/story_workflow2")))
+    if not assets_root.is_absolute():
+        assets_root = ROOT / assets_root
+    configured_path = Path(str(configured_reference)) if configured_reference else None
+    external_legacy_reference = bool(configured_path and configured_path.is_absolute() and not _is_relative_to(configured_path, assets_root))
+    has_identity_reference = bool(configured_reference) and not is_legacy_shared_identity_value(config, configured_reference) and not external_legacy_reference
+    speaker_definition = dict(speaker_subject)
+    if has_identity_reference:
+        speaker_definition["reference_picture"] = 1
+    else:
+        speaker_definition.pop("reference_picture", None)
+    local_config["subjects"] = [
+        speaker_definition
+    ]
     profiles = voice_profiles(config)
     if speaker_key in profiles:
         local_config["voice_references"] = {speaker_key: profiles[speaker_key]}
@@ -733,6 +1441,9 @@ def newest_streamed_master(started_at: float) -> Path:
 
 
 def prepare_h3_generation(config: dict, paths: RuntimePaths, base_url: str) -> None:
+    validate_story_identity_policy(config, paths.config_path)
+    write_story_identity_manifest(config, paths)
+    register_story_identity(config, paths)
     model_path = ROOT / "models" / "diffusion_models" / UNET
     if not model_path.exists() or model_path.stat().st_size < 20_000_000_000:
         raise RuntimeError(f"Required Ref2VA model is incomplete: {model_path}")
@@ -748,30 +1459,177 @@ def prepare_h3_generation(config: dict, paths: RuntimePaths, base_url: str) -> N
     ensure_server(base_url)
 
 
+def split_chain_for_speaker_lock(config: dict, scene_ids: list[int]) -> list[tuple[list[int], bool]]:
+    """Split dialogue and high-risk action shots into isolated H3 contexts."""
+    scenes_by_id = {int(scene["id"]): scene for scene in config["scenes"]}
+    generation = config.get("generation", {})
+    scene_mode = str(generation.get("scene_mode", "single_shot") if isinstance(generation, dict) else "single_shot").lower()
+    if scene_mode in {"single_shot", "one_scene_per_take", "isolated"}:
+        # H3's multishot node is excellent for one coherent take, but asking it
+        # to depict several unrelated plot beats in one prompt invites it to
+        # invent bridges and makes the external narration disagree with the
+        # rendered action.  Keep every authored scene as one 15s take by
+        # default; the final assembler still preserves the story's chain order.
+        return [([int(scene_id)], bool(scenes_by_id[int(scene_id)].get("dialogue"))) for scene_id in scene_ids]
+    parts: list[tuple[list[int], bool]] = []
+    silent_ids: list[int] = []
+    for scene_id in scene_ids:
+        scene = scenes_by_id[int(scene_id)]
+        contract = scene.get("shot_contract")
+        isolated = bool(scene.get("isolated", False)) or (
+            isinstance(contract, dict) and bool(contract.get("isolated", False))
+        )
+        if scene.get("dialogue") or isolated:
+            if silent_ids:
+                parts.append((silent_ids, False))
+                silent_ids = []
+            parts.append(([int(scene_id)], bool(scene.get("dialogue"))))
+        else:
+            silent_ids.append(int(scene_id))
+    if silent_ids:
+        parts.append((silent_ids, False))
+    return parts
+
+
+def scoped_component_context(
+    config: dict,
+    paths: RuntimePaths,
+    source_scenes: list[dict],
+    subject_identity_inputs: dict[str, str],
+) -> tuple[dict, RuntimePaths, list[dict], int]:
+    """Give each component only its declared cast and matching identity batch."""
+    all_subjects = normalize_subjects(config)
+    requested = {
+        str(subject_id)
+        for scene in source_scenes
+        for subject_id in scene.get("subject_ids", [])
+    }
+    local_subjects = [subject for subject in all_subjects if subject["id"] in requested]
+    if not local_subjects:
+        local_subjects = list(all_subjects)
+    referenced_ids = {subject["id"] for subject in local_subjects if subject["id"] in subject_identity_inputs}
+    referenced_subjects = [subject for subject in local_subjects if subject["id"] in referenced_ids]
+    local_config = copy.deepcopy(config)
+    local_config["subjects"] = []
+    for subject in local_subjects:
+        item = copy.deepcopy(subject)
+        if item["id"] in referenced_ids:
+            item["reference_picture"] = next(
+                index for index, ref in enumerate(referenced_subjects, start=1) if ref["id"] == item["id"]
+            )
+        else:
+            item.pop("reference_picture", None)
+        local_config["subjects"].append(item)
+    local_config["scenes"] = copy.deepcopy(source_scenes)
+    local_config["chains"] = [[int(scene["id"]) for scene in source_scenes]]
+    local_config["assets"] = copy.deepcopy(local_config.get("assets", {}))
+    local_config["assets"]["reference_subjects"] = "1,1" if len(referenced_subjects) > 1 else ""
+    local_paths = copy.copy(paths)
+    if len(referenced_subjects) == 1:
+        local_paths.comfy_identity_ref = subject_identity_inputs[referenced_subjects[0]["id"]]
+    elif not referenced_subjects:
+        # Never pass another character's portrait as a substitute identity.
+        # Text-only subjects are safer than making a host/coachman inherit the
+        # protagonist's face and then attaching the wrong dialogue to it.
+        local_paths.comfy_identity_ref = None
+    return local_config, local_paths, local_subjects, len(referenced_subjects)
+
+
+def join_generated_components(sources: list[Path], destination: Path) -> None:
+    """Join independently generated components without changing their pixels."""
+    if not sources:
+        raise ValueError("cannot join an empty component list")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if len(sources) == 1:
+        shutil.copy2(sources[0], destination)
+        return
+    manifest = destination.with_suffix(".components.txt")
+    manifest.write_text("".join(f"file '{source}'\n" for source in sources))
+    try:
+        run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+            "-i", str(manifest), "-c", "copy", "-movflags", "+faststart", str(destination),
+        ])
+    finally:
+        manifest.unlink(missing_ok=True)
+
+
 def generate(config: dict, paths: RuntimePaths, base_url: str, force: bool) -> None:
     prepare_h3_generation(config, paths, base_url)
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    write_scene_manifest(config, paths)
+    subject_identity_inputs = stage_subject_identity_references(config, paths)
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     for chain_index, scene_ids in enumerate(config["chains"], start=1):
         destination = paths.chains_dir / f"chain_{chain_index:02d}.mp4"
         expected = len(scene_ids) * shot_seconds
-        if not force and valid_video(destination, expected - 3):
+        chain_signature = render_signature(config, [int(scene_id) for scene_id in scene_ids])
+        if not force and valid_video(destination, expected - 3) and signature_matches(destination, chain_signature):
             print(f"CHAIN {chain_index:02d} SKIPPED {destination}", flush=True)
             continue
-        guide_audio = stage_audio_spine(
-            config,
-            paths,
-            key=f"chain_{chain_index:02d}",
-            scene_ids=[int(scene_id) for scene_id in scene_ids],
-            force=force,
-        )
-        graph = graph_for_chain(config, paths, chain_index, [int(scene_id) for scene_id in scene_ids], guide_audio)
-        (paths.workflows_dir / f"chain_{chain_index:02d}_api.json").write_text(json.dumps(graph, ensure_ascii=False, indent=2) + "\n")
-        started_at = time.time()
-        submit_and_wait(base_url, graph, chain_index)
-        streamed = newest_streamed_master(started_at)
-        shutil.copy2(streamed, destination)
+        component_paths: list[Path] = []
+        components_dir = paths.chains_dir / f"chain_{chain_index:02d}_components"
+        for component_index, (component_scene_ids, speaker_locked) in enumerate(
+            split_chain_for_speaker_lock(config, [int(scene_id) for scene_id in scene_ids]), start=1
+        ):
+            component_name = "_".join(f"{scene_id:02d}" for scene_id in component_scene_ids)
+            component_destination = components_dir / f"component_{component_index:02d}_{component_name}.mp4"
+            component_expected = len(component_scene_ids) * shot_seconds
+            component_paths.append(component_destination)
+            component_signature = render_signature(config, [int(scene_id) for scene_id in component_scene_ids])
+            if not force and valid_video(component_destination, component_expected - 3) and signature_matches(component_destination, component_signature):
+                print(f"CHAIN {chain_index:02d} COMPONENT {component_index:02d} SKIPPED {component_destination}", flush=True)
+                continue
+
+            local_config = config
+            local_paths = paths
+            if speaker_locked:
+                source_scene = next(scene for scene in config["scenes"] if int(scene["id"]) == component_scene_ids[0])
+                local_config, _, speaker_key = speaker_locked_dialogue_config(config, source_scene)
+                local_paths = copy.copy(paths)
+                local_paths.comfy_identity_ref = subject_identity_inputs.get(speaker_key)
+                if speaker_key in paths.comfy_voice_refs:
+                    local_paths.comfy_voice_refs = {speaker_key: paths.comfy_voice_refs[speaker_key]}
+            else:
+                component_scenes = [
+                    next(scene for scene in config["scenes"] if int(scene["id"]) == int(scene_id))
+                    for scene_id in component_scene_ids
+                ]
+                local_config, local_paths, _, _ = scoped_component_context(
+                    config, paths, component_scenes, subject_identity_inputs
+                )
+
+            guide_audio = stage_audio_spine(
+                config,
+                paths,
+                key=f"chain_{chain_index:02d}_component_{component_index:02d}",
+                scene_ids=component_scene_ids,
+                force=force,
+            )
+            graph = graph_for_chain(
+                local_config,
+                local_paths,
+                chain_index * 100 + component_index,
+                component_scene_ids,
+                guide_audio,
+            )
+            workflow_path = paths.workflows_dir / f"chain_{chain_index:02d}_component_{component_index:02d}_api.json"
+            workflow_path.write_text(json.dumps(graph, ensure_ascii=False, indent=2) + "\n")
+            started_at = time.time()
+            submit_and_wait(base_url, graph, chain_index * 100 + component_index)
+            streamed = newest_streamed_master(started_at)
+            component_destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(streamed, component_destination)
+            if not valid_video(component_destination, component_expected - 3):
+                raise RuntimeError(
+                    f"Chain {chain_index:02d} component {component_index:02d} failed duration validation: {component_destination}"
+                )
+            write_signature(component_destination, component_signature)
+            print(f"CHAIN {chain_index:02d} COMPONENT {component_index:02d} SAVED {component_destination}", flush=True)
+
+        join_generated_components(component_paths, destination)
         if not valid_video(destination, expected - 3):
             raise RuntimeError(f"Chain {chain_index} failed duration validation: {destination}")
+        write_signature(destination, chain_signature)
         print(f"CHAIN {chain_index:02d} SAVED {destination}", flush=True)
 
 
@@ -794,7 +1652,7 @@ def generate_audio_spine_dialogue_scenes(
     requested = list(dict.fromkeys(int(scene_id) for scene_id in scene_ids))
     if not requested:
         raise ValueError("at least one dialogue scene is required")
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     output_dir = paths.chains_dir / "audio_spine_dialogue"
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered: dict[int, Path] = {}
@@ -823,7 +1681,7 @@ def generate_audio_spine_dialogue_scenes(
             raise AssertionError(f"Scene {scene_id} unexpectedly has no audio spine")
         local_config, _, speaker_key = speaker_locked_dialogue_config(config, scene)
         local_paths = copy.copy(paths)
-        local_paths.comfy_identity_ref = subject_identity_inputs.get(speaker_key, paths.comfy_identity_ref)
+        local_paths.comfy_identity_ref = subject_identity_inputs.get(speaker_key)
         local_paths.comfy_voice_refs = {
             speaker_key: paths.comfy_voice_refs[speaker_key]
         } if speaker_key in paths.comfy_voice_refs else dict(paths.comfy_voice_refs)
@@ -850,7 +1708,12 @@ def prepare_visual_workflow(config: dict, paths: RuntimePaths, force_voice_refs:
     reference, and Audio Spine.  The canvas then joins those components back
     into their original narrative chains before the final assembler runs.
     """
+    validate_story_identity_policy(config, paths.config_path)
+    write_story_identity_manifest(config, paths)
+    register_story_identity(config, paths)
     stage_identity(paths)
+    write_scene_manifest(config, paths)
+    bgm_input = stage_bgm(config, paths, force=force_voice_refs)
     subject_identity_inputs = stage_subject_identity_references(config, paths)
     asyncio.run(synthesize_voice_refs(config, paths, force=force_voice_refs))
     asyncio.run(synthesize_dialogues(config, paths, force=force_voice_refs))
@@ -859,26 +1722,14 @@ def prepare_visual_workflow(config: dict, paths: RuntimePaths, force_voice_refs:
     profiles = voice_profiles(config)
     ordered_keys = scene_voice_keys(config, config["scenes"])
     voice_inputs = [(key, paths.comfy_voice_refs[key]) for key in ordered_keys if key in profiles][:3]
+    generation = config.get("generation", {}) if isinstance(config.get("generation", {}), dict) else {}
     scenes_by_id = {int(scene["id"]): scene for scene in config["scenes"]}
-    all_subjects = normalize_subjects(config)
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     chain_specs: list[dict[str, Any]] = []
     chain_part_indices: list[list[int]] = []
 
     for original_chain_index, original_scene_ids in enumerate(config["chains"], start=1):
-        parts: list[tuple[list[int], bool]] = []
-        silent_scene_ids: list[int] = []
-        for scene_id in original_scene_ids:
-            scene = scenes_by_id[int(scene_id)]
-            if scene.get("dialogue"):
-                if silent_scene_ids:
-                    parts.append((silent_scene_ids, False))
-                    silent_scene_ids = []
-                parts.append(([int(scene_id)], True))
-            else:
-                silent_scene_ids.append(int(scene_id))
-        if silent_scene_ids:
-            parts.append((silent_scene_ids, False))
+        parts = split_chain_for_speaker_lock(config, [int(scene_id) for scene_id in original_scene_ids])
 
         part_indices: list[int] = []
         for part_number, (scene_ids, speaker_locked) in enumerate(parts, start=1):
@@ -888,27 +1739,23 @@ def prepare_visual_workflow(config: dict, paths: RuntimePaths, force_voice_refs:
                 local_scenes = [local_scene]
                 local_subjects = normalize_subjects(local_config)
                 voice_keys = [speaker_key] if speaker_key in paths.comfy_voice_refs else []
-                identity_input = subject_identity_inputs.get(speaker_key, paths.comfy_identity_ref)
+                identity_input = subject_identity_inputs.get(speaker_key)
             else:
-                requested_subjects = {
-                    str(subject_id)
-                    for scene in source_scenes
-                    for subject_id in scene.get("subject_ids", [])
-                }
-                local_subjects = [subject for subject in all_subjects if subject["id"] in requested_subjects]
-                if not local_subjects:
-                    local_subjects = list(all_subjects)
-                local_config = copy.deepcopy(config)
-                local_config["subjects"] = [
-                    {**subject, "reference_picture": index}
-                    for index, subject in enumerate(local_subjects, start=1)
-                ]
+                local_config, _, local_subjects, reference_subject_count = scoped_component_context(
+                    config, paths, source_scenes, subject_identity_inputs
+                )
                 local_scenes = source_scenes
                 voice_keys = [subject["id"] for subject in local_subjects if subject["id"] in profiles]
                 identity_input = (
-                    subject_identity_inputs[local_subjects[0]["id"]]
-                    if len(local_subjects) == 1 and local_subjects[0]["id"] in subject_identity_inputs
-                    else paths.comfy_identity_ref
+                    subject_identity_inputs[next(
+                        subject["id"] for subject in local_subjects if subject["id"] in subject_identity_inputs
+                    )]
+                    if reference_subject_count == 1
+                    else None
+                )
+            if speaker_locked:
+                reference_subject_count = sum(
+                    1 for subject in normalize_subjects(local_config) if "reference_picture" in subject
                 )
             audio_label_map = {key: index + 1 for index, key in enumerate(voice_keys)}
             guide_audio = stage_audio_spine(
@@ -933,12 +1780,36 @@ def prepare_visual_workflow(config: dict, paths: RuntimePaths, force_voice_refs:
                     "guide_audio": guide_audio,
                     "width": int(video_value(config, "width", 768)),
                     "height": int(video_value(config, "height", 1344)),
-                    "frames_per_shot": int(video_value(config, "frames_per_shot", 243)),
+                    "frames_per_shot": int(video_value(config, "frames_per_shot", 362)),
                     "fps": int(video_value(config, "fps", 24)),
                     "steps": int(video_value(config, "steps", 14)),
                     "sampler": str(video_value(config, "sampler", "euler")),
                     "scheduler": str(video_value(config, "scheduler", "beta57")),
-                    "reference_subjects": ",".join("1" for _ in local_subjects) if len(local_subjects) > 1 else "",
+                    **({
+                        key: generation_value
+                        for key, generation_value in (
+                            ("continuity", generation.get("continuity", "cut")),
+                            ("chain_gain_control", generation.get("chain_gain_control", "off")),
+                            ("bank_pinned", generation.get("bank_pinned", 1)),
+                            ("bank_clip_frames", generation.get("bank_clip_frames", 22)),
+                            ("color_level", generation.get("color_level", "off")),
+                            ("join_anchor_noise", generation.get("join_anchor_noise", 0.0)),
+                            ("join_blend", generation.get("join_blend", False)),
+                            ("handoff_release", generation.get("handoff_release", 0.30)),
+                            ("bank_ref_noise", generation.get("bank_ref_noise", 0.0)),
+                            ("end_anchor", generation.get("end_anchor", False)),
+                            ("audio_lock", generation.get("audio_lock", False)),
+                            ("handoff_taper", generation.get("handoff_taper", 0)),
+                            ("handoff_depth", generation.get("handoff_depth", "block")),
+                            ("self_anchor_voice", generation.get("self_anchor_voice", False)),
+                            ("master_normalize", generation.get("master_normalize", "luma+contrast")),
+                            ("pin_frames", generation.get("pin_frames", "22")),
+                            ("pin_noise", generation.get("pin_noise", 0.0)),
+                            ("pin_renorm", generation.get("pin_renorm", False)),
+                            ("low_ram_master", generation.get("low_ram_master", True)),
+                        )
+                    }),
+                    "reference_subjects": "1,1" if reference_subject_count > 1 else "",
                     "seed": int(config.get("seed", 920260901)) + original_chain_index * 104729 + part_number * 7919,
                 }
             )
@@ -954,6 +1825,7 @@ def prepare_visual_workflow(config: dict, paths: RuntimePaths, force_voice_refs:
         config_path=paths.config_path,
         identity_input=paths.comfy_identity_ref,
         voice_inputs=voice_inputs,
+        bgm_input=bgm_input,
         chain_specs=chain_specs,
         chain_part_indices=chain_part_indices,
         model_names={"unet": UNET, "clip": CLIP, "video_vae": VIDEO_VAE, "audio_vae": AUDIO_VAE},
@@ -969,6 +1841,40 @@ def narration_voice(config: dict) -> dict:
     return {"voice": "zh-CN-YunyangNeural", "rate": "+8%", "pitch": "-2Hz", "volume": "+0%", **voice}
 
 
+async def synthesize_tts(
+    text: str,
+    voice: str,
+    output: Path,
+    *,
+    rate: str,
+    pitch: str,
+    volume: str,
+    attempts: int = 4,
+) -> None:
+    """Write Edge TTS output atomically and retry transient network failures."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".part")
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            temporary.unlink(missing_ok=True)
+            await edge_tts.Communicate(
+                text, voice, rate=rate, pitch=pitch, volume=volume
+            ).save(str(temporary))
+            if not temporary.exists() or temporary.stat().st_size < 1024:
+                raise RuntimeError(f"Edge TTS returned an empty file: {temporary}")
+            temporary.replace(output)
+            return
+        except Exception as exc:
+            last_error = exc
+            temporary.unlink(missing_ok=True)
+            if attempt < attempts:
+                print(f"TTS RETRY {attempt}/{attempts - 1}: {output.name}", flush=True)
+                await asyncio.sleep(float(2 ** (attempt - 1)))
+    assert last_error is not None
+    raise last_error
+
+
 async def synthesize(config: dict, paths: RuntimePaths, force: bool) -> None:
     paths.narration_dir.mkdir(parents=True, exist_ok=True)
     spec = narration_voice(config)
@@ -981,7 +1887,11 @@ async def synthesize(config: dict, paths: RuntimePaths, force: bool) -> None:
             except (subprocess.CalledProcessError, ValueError):
                 pass
         print(f"NARRATION {int(scene['id']):02d}", flush=True)
-        await edge_tts.Communicate(str(scene["narration"]), str(spec["voice"]), rate=str(spec.get("rate", "+8%")), pitch=str(spec.get("pitch", "-2Hz")), volume=str(spec.get("volume", "+0%"))).save(str(output))
+        await synthesize_tts(
+            str(scene["narration"]), str(spec["voice"]), output,
+            rate=str(spec.get("rate", "+8%")), pitch=str(spec.get("pitch", "-2Hz")),
+            volume=str(spec.get("volume", "+0%")),
+        )
 
 
 async def synthesize_dialogues(config: dict, paths: RuntimePaths, force: bool) -> None:
@@ -1003,7 +1913,11 @@ async def synthesize_dialogues(config: dict, paths: RuntimePaths, force: bool) -
             except (subprocess.CalledProcessError, ValueError):
                 pass
         print(f"DIALOGUE {int(scene['id']):02d}", flush=True)
-        await edge_tts.Communicate(str(dialogue["text"]), str(profile.get("voice", "zh-CN-YunxiNeural")), rate=str(profile.get("fallback_rate", "+20%")), pitch=str(profile.get("pitch", "+0Hz")), volume=str(profile.get("volume", "+0%"))).save(str(output))
+        await synthesize_tts(
+            str(dialogue["text"]), str(profile.get("voice", "zh-CN-YunxiNeural")), output,
+            rate=str(profile.get("fallback_rate", "+20%")), pitch=str(profile.get("pitch", "+0Hz")),
+            volume=str(profile.get("volume", "+0%")),
+        )
 
 
 def ass_time(seconds: float) -> str:
@@ -1189,7 +2103,7 @@ def existing_chain_paths(config: dict, paths: RuntimePaths) -> list[Path]:
     """Locate the saved H3 masters that the current release was built from."""
     output_dir = ROOT / "output" / "video" / "workflow2" / paths.slug
     result: list[Path] = []
-    shot_seconds = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    shot_seconds = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     for chain_index, scene_ids in enumerate(config["chains"], start=1):
         expected = len(scene_ids) * shot_seconds
         candidates = [paths.chains_dir / f"chain_{chain_index:02d}.mp4"]
@@ -1275,7 +2189,7 @@ def replace_dialogue_scenes(
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
             "-i", str(manifest), "-c", "copy", "-movflags", "+faststart", str(destination),
         ])
-        expected = len(scene_ids) * float(video_value(config, "frames_per_shot", 243)) / fps
+        expected = len(scene_ids) * float(video_value(config, "frames_per_shot", 362)) / fps
         if not valid_video(destination, expected - 3):
             raise RuntimeError(f"Replacement chain {chain_index:02d} failed duration validation: {destination}")
         output_paths.append(destination)
@@ -1294,8 +2208,13 @@ def render_cover(config: dict, final_video: Path) -> Path | None:
         return None
     if not isinstance(cover, dict):
         raise ValueError("cover must be an object or false")
-    width = int(config.get("output_width", 1080))
-    height = int(config.get("output_height", 1920))
+    video_width = int(config.get("output_width", 1080))
+    # Douyin displays a 3:4 crop for a vertical-video cover.  Generate that
+    # crop directly so a title cannot disappear below the platform crop.
+    width = int(cover.get("width", video_width))
+    height = int(cover.get("height", round(width * 4 / 3)))
+    if width <= 0 or height <= 0:
+        raise ValueError("cover width and height must be positive")
     title = str(cover.get("title", config["title"])).strip()
     if not title:
         raise ValueError("cover.title cannot be empty")
@@ -1306,16 +2225,15 @@ def render_cover(config: dict, final_video: Path) -> Path | None:
     destination = final_video.parent / filename
     title_filter = title.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
     font_filter = str(font).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-    band_top = int(height * 0.67)
-    title_size = int(cover.get("font_size", max(86, round(width * 0.105))))
+    title_size = int(cover.get("font_size", max(112, round(width * 0.145))))
+    title_y = int(cover.get("title_y", height * 0.15))
     cover_time = max(0.0, float(cover.get("time", 2.0)))
     video_filter = (
         f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
         f"crop={width}:{height},setsar=1,"
-        f"drawbox=x=0:y={band_top}:w={width}:h={height - band_top}:color=black@0.44:t=fill,"
-        f"drawtext=fontfile='{font_filter}':text='{title_filter}':fontcolor=0xF4E4BE:"
-        f"fontsize={title_size}:x=(w-text_w)/2:y={band_top + int(height * 0.055)}:"
-        "shadowcolor=black@0.96:shadowx=4:shadowy=4"
+        f"drawtext=fontfile='{font_filter}':text='{title_filter}':fontcolor=0xF8E8C0:"
+        f"fontsize={title_size}:x=(w-text_w)/2:y={title_y}:"
+        "borderw=7:bordercolor=black@0.96:shadowcolor=black@0.92:shadowx=3:shadowy=3"
     )
     run([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{cover_time:.3f}",
@@ -1332,6 +2250,7 @@ def assemble(
     paths: RuntimePaths,
     force_tts: bool,
     chain_paths: list[Path] | None = None,
+    bgm_path: Path | None = None,
 ) -> Path:
     asyncio.run(synthesize(config, paths, force_tts))
     asyncio.run(synthesize_dialogues(config, paths, force_tts))
@@ -1339,7 +2258,8 @@ def assemble(
     if chain_paths is None:
         chain_paths = [paths.chains_dir / f"chain_{index:02d}.mp4" for index in range(1, len(config["chains"]) + 1)]
     chain_paths = [path.expanduser().resolve() for path in chain_paths]
-    shot_duration = float(video_value(config, "frames_per_shot", 243)) / float(video_value(config, "fps", 24))
+    chain_paths = normalize_chain_paths(config, paths, chain_paths)
+    shot_duration = float(video_value(config, "frames_per_shot", 362)) / float(video_value(config, "fps", 24))
     for index, path in enumerate(chain_paths):
         expected = len(config["chains"][index]) * shot_duration
         if not valid_video(path, expected - 3):
@@ -1347,15 +2267,36 @@ def assemble(
     timeline = build_scene_timeline(config, chain_paths)
     total = float(timeline[-1]["end"])
     audio_events = build_audio_plan(config, paths, timeline)
+    bgm_source = resolve_bgm_source(config, paths, bgm_path)
+    bgm_setting = config.get("bgm", {}) if isinstance(config.get("bgm", {}), dict) else {}
     timeline_path = paths.final_dir / "workflow2_audio_timeline.json"
-    timeline_path.write_text(json.dumps({"video": timeline, "speech": audio_events}, ensure_ascii=False, indent=2, default=str) + "\n")
+    timeline_path.write_text(json.dumps({
+        "video": timeline,
+        "speech": audio_events,
+        "bgm": {
+            "enabled": bool(bgm_source),
+            "source_type": str(bgm_setting.get("source_type", "file")),
+            "source": str(bgm_source) if bgm_source else None,
+            "sha256": hashlib.sha256(bgm_source.read_bytes()).hexdigest() if bgm_source else None,
+            "volume": float(bgm_setting.get("volume", 0.10)),
+            "duck_ratio": float(bgm_setting.get("duck_ratio", 18.0)),
+            "source_url": bgm_setting.get("source_url"),
+            "credit": bgm_setting.get("credit"),
+        },
+    }, ensure_ascii=False, indent=2, default=str) + "\n")
     concat_list = paths.final_dir / "chains.txt"
     concat_list.write_text("".join(f"file '{path}'\n" for path in chain_paths))
     raw_master = paths.final_dir / "workflow2_native_master_raw.mkv"
     run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(raw_master)])
     clean_master = paths.final_dir / "workflow2_native_master_clean.mp4"
     from remove_h3_speech import clean_video
-    clean_video(raw_master, clean_master)
+    # H3 vocal separation is CPU-heavy.  Reuse a clean master when none of
+    # the source chains changed; this keeps audio-only mix iterations fast.
+    newest_chain_mtime = max(path.stat().st_mtime_ns for path in chain_paths)
+    if clean_master.exists() and clean_master.stat().st_mtime_ns >= newest_chain_mtime:
+        print(f"CLEAN H3 AUDIO SKIPPED {clean_master}", flush=True)
+    else:
+        clean_video(raw_master, clean_master)
     narration_track = paths.final_dir / "workflow2_narration_track.wav"
     dialogue_track = paths.final_dir / "workflow2_dialogue_track.wav"
     render_speech_track([event for event in audio_events if event["kind"] == "narration"], total, narration_track)
@@ -1366,8 +2307,26 @@ def assemble(
     final_video = paths.final_dir / filename
     subtitle_filter = str(subtitles).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
     output_width, output_height = int(config.get("output_width", 1080)), int(config.get("output_height", 1920))
-    filter_complex = f"[0:v]scale={output_width}:{output_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={output_width}:{output_height},setsar=1,fps={int(video_value(config, 'output_fps', 24))},eq=contrast=1.02:saturation=1.025,ass='{subtitle_filter}'[v];[0:a]aresample=48000:async=1:first_pts=0,volume=1.50,highpass=f=42,lowpass=f=15500,alimiter=limit=0.55[native];[1:a]aresample=48000:async=1:first_pts=0,volume=1.00,highpass=f=75,lowpass=f=12500,acompressor=threshold=0.12:ratio=2.5:attack=8:release=180[narration];[2:a]aresample=48000:async=1:first_pts=0,volume=1.04,highpass=f=75,lowpass=f=12500,acompressor=threshold=0.12:ratio=2.5:attack=8:release=180[dialogue];[narration][dialogue]amix=inputs=2:duration=first:normalize=0,asplit=2[voice_sc][voice_mix];[native][voice_sc]sidechaincompress=threshold=0.018:ratio=14:attack=25:release=500:knee=4[ducked];[ducked][voice_mix]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.84[a]"
-    run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(clean_master), "-i", str(narration_track), "-i", str(dialogue_track), "-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]", "-t", f"{total:.6f}", "-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-movflags", "+faststart", str(final_video)])
+    filter_complex = f"[0:v]scale={output_width}:{output_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={output_width}:{output_height},setsar=1,fps={int(video_value(config, 'output_fps', 24))},eq=contrast=1.02:saturation=1.025,ass='{subtitle_filter}'[v];[0:a]aresample=48000:async=1:first_pts=0,volume=1.50,highpass=f=42,lowpass=f=15500,alimiter=limit=0.55[native];[1:a]aresample=48000:async=1:first_pts=0,volume=1.00,highpass=f=75,lowpass=f=12500,acompressor=threshold=0.12:ratio=2.5:attack=8:release=180[narration];[2:a]aresample=48000:async=1:first_pts=0,volume=1.04,highpass=f=75,lowpass=f=12500,acompressor=threshold=0.12:ratio=2.5:attack=8:release=180[dialogue];[narration][dialogue]amix=inputs=2:duration=first:normalize=0,asplit=2[voice_sc][voice_mix]"
+    ffmpeg_inputs = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(clean_master), "-i", str(narration_track), "-i", str(dialogue_track)]
+    if bgm_source:
+        bgm_volume = max(0.0, min(0.35, float(bgm_setting.get("volume", 0.10))))
+        fade_in = max(0.0, float(bgm_setting.get("fade_in", 4.0)))
+        fade_out = max(0.0, float(bgm_setting.get("fade_out", 8.0)))
+        fade_out_start = max(0.0, total - fade_out)
+        duck_ratio = max(1.0, min(30.0, float(bgm_setting.get("duck_ratio", 18.0))))
+        filter_complex += (
+            f";[3:a]aresample=48000:async=1:first_pts=0,aformat=channel_layouts=stereo,"
+            f"volume={bgm_volume:.4f},lowpass=f=9000,afade=t=in:st=0:d={fade_in:.3f},"
+            f"afade=t=out:st={fade_out_start:.3f}:d={fade_out:.3f}[bgm];"
+            f"[native][bgm]amix=inputs=2:duration=first:normalize=0[bed];"
+            f"[bed][voice_sc]sidechaincompress=threshold=0.018:ratio={duck_ratio:.2f}:attack=25:release=650:knee=5[ducked];"
+            f"[ducked][voice_mix]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.84[a]"
+        )
+        ffmpeg_inputs.extend(["-stream_loop", "-1", "-i", str(bgm_source)])
+    else:
+        filter_complex += ";[native][voice_sc]sidechaincompress=threshold=0.018:ratio=14:attack=25:release=500:knee=4[ducked];[ducked][voice_mix]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.84[a]"
+    run(ffmpeg_inputs + ["-filter_complex", filter_complex, "-map", "[v]", "-map", "[a]", "-t", f"{total:.6f}", "-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-movflags", "+faststart", str(final_video)])
     render_cover(config, final_video)
     return final_video
 
@@ -1412,9 +2371,10 @@ def main() -> None:
         parser.error(f"config does not exist: {config_path}")
     config = json.loads(config_path.read_text())
     validate_config(config)
+    validate_story_identity_policy(config, config_path)
     paths = build_paths(config, config_path)
     if args.dry_run:
-        print(json.dumps({"mode": args.mode, "title": config["title"], "slug": paths.slug, "scenes": len(config["scenes"]), "chains": len(config["chains"]), "output_dir": str(paths.final_dir), "output_filename": config.get("output_filename", f"{paths.slug}_workflow2_vertical_1080x1920.mp4")}, ensure_ascii=False, indent=2))
+        print(json.dumps({"mode": args.mode, "title": config["title"], "slug": paths.slug, "identity_namespace": identity_namespace(config), "unique_story_cast": bool(identity_policy(config).get("require_unique_story_cast", False)), "scenes": len(config["scenes"]), "chains": len(config["chains"]), "scene_mode": (config.get("generation", {}) or {}).get("scene_mode", "single_shot"), "bgm_source_type": (config.get("bgm", {}) or {}).get("source_type", "file"), "output_dir": str(paths.final_dir), "output_filename": config.get("output_filename", f"{paths.slug}_workflow2_vertical_1080x1920.mp4")}, ensure_ascii=False, indent=2))
         return
     if args.audio_spine_dialogue_scene:
         rendered = generate_audio_spine_dialogue_scenes(
