@@ -6,9 +6,11 @@ import os
 import subprocess
 import sys
 import tempfile
+import wave
 from pathlib import Path, PurePosixPath
 
 import folder_paths
+import numpy as np
 from comfy_api.latest import InputImpl
 
 
@@ -25,6 +27,7 @@ class Workflow2VideoFromPaths:
             f"path_{letter}": ("STRING", {"forceInput": True})
             for letter in "bcdefgh"
         }
+        optional["bgm"] = ("AUDIO",)
         return {
             "required": {
                 "path_a": ("STRING", {"forceInput": True}),
@@ -143,6 +146,27 @@ class Workflow2StoryAssembler:
             raise ValueError("story config must be a file inside the ComfyUI project")
         return candidate
 
+    @staticmethod
+    def _write_audio_input(audio, destination: Path) -> Path:
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        sample_rate = int(audio.get("sample_rate", 48000)) if isinstance(audio, dict) else 48000
+        if waveform is None:
+            raise ValueError("BGM AUDIO input is empty")
+        if getattr(waveform, "ndim", 0) == 3:
+            waveform = waveform[0]
+        if getattr(waveform, "ndim", 0) == 1:
+            waveform = waveform.unsqueeze(0)
+        waveform = waveform[:2].detach().cpu().clamp(-1.0, 1.0)
+        if waveform.shape[0] == 1:
+            waveform = waveform.repeat(2, 1)
+        pcm = (waveform.transpose(0, 1).contiguous().numpy() * 32767.0).astype("<i2").tobytes()
+        with wave.open(str(destination), "wb") as handle:
+            handle.setnchannels(int(waveform.shape[0]))
+            handle.setsampwidth(2)
+            handle.setframerate(sample_rate)
+            handle.writeframes(pcm)
+        return destination
+
     def assemble(self, config_path, path_a, **kwargs):
         from run_workflow2 import assemble, build_paths, validate_config, verify
 
@@ -155,7 +179,19 @@ class Workflow2StoryAssembler:
         validate_config(config)
         if len(sources) != len(config["chains"]):
             raise ValueError("the number of H3 chain paths must match story config.chains")
-        final_path = assemble(config, build_paths(config, config_file), force_tts=False, chain_paths=sources)
+        paths = build_paths(config, config_file)
+        bgm_audio = kwargs.get("bgm")
+        bgm_path = None
+        if bgm_audio is not None:
+            paths.final_dir.mkdir(parents=True, exist_ok=True)
+            handle, temporary_name = tempfile.mkstemp(prefix=".workflow2_bgm_", suffix=".wav", dir=paths.final_dir)
+            os.close(handle)
+            bgm_path = self._write_audio_input(bgm_audio, Path(temporary_name))
+        try:
+            final_path = assemble(config, paths, force_tts=False, chain_paths=sources, bgm_path=bgm_path)
+        finally:
+            if bgm_path:
+                bgm_path.unlink(missing_ok=True)
         verify(final_path, config)
         return (InputImpl.VideoFromFile(str(final_path)), str(final_path))
 
